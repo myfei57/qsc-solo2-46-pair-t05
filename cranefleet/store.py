@@ -10,6 +10,7 @@ production and in memory during tests.
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import threading
@@ -19,6 +20,41 @@ from pathlib import Path
 from .errors import StoreError, StoreNotFound
 
 SNAPSHOT_VERSION = 1
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    """Write ``payload`` to ``path`` so an interrupted write never tears the file.
+
+    The bytes land in a sibling temporary file first, are flushed to disk and
+    are then renamed over the target, so a crash — including a power cut —
+    leaves either the old file or the new one, never a mixture.
+    """
+
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except OSError as exc:
+        raise StoreError(f"cannot persist {path.name}") from exc
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Best-effort fsync of ``directory`` so the rename itself survives a crash."""
+
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
 
 
 class Store(ABC):
@@ -68,14 +104,8 @@ class FileStore(Store):
         return self._directory / (key.replace("/", "_") + ".bin")
 
     def save(self, key: str, value: bytes) -> None:
-        target = self._path(key)
         with self._lock:
-            temporary = target.with_suffix(".bin.tmp")
-            try:
-                temporary.write_bytes(bytes(value))
-                os.replace(temporary, target)
-            except OSError as exc:
-                raise StoreError(f"cannot persist {key}") from exc
+            atomic_write(self._path(key), bytes(value))
 
     def load(self, key: str) -> bytes:
         with self._lock:
@@ -137,11 +167,35 @@ def encode_snapshot(snapshot: dict[str, bytes]) -> bytes:
 
 
 def decode_snapshot(encoded: bytes) -> dict[str, bytes]:
-    """Decode a snapshot produced by :func:`encode_snapshot`."""
+    """Decode a snapshot produced by :func:`encode_snapshot`.
 
-    payload = json.loads(encoded.decode("utf-8"))
-    data = payload.get("data") or {}
-    return {key: base64.b64decode(value) for key, value in data.items()}
+    Raises :class:`StoreError` describing the problem when the bytes are not
+    a well-formed snapshot, so the caller can set the file aside instead of
+    crashing on a torn write.
+    """
+
+    try:
+        text = encoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise StoreError(f"snapshot is not valid UTF-8: {exc}") from exc
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise StoreError(f"snapshot is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+        raise StoreError("snapshot does not have the expected structure")
+    version = payload.get("version")
+    if version != SNAPSHOT_VERSION:
+        raise StoreError(f"snapshot version {version!r} is not supported")
+    data: dict[str, bytes] = {}
+    for key, value in payload["data"].items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise StoreError("snapshot holds a non-string entry")
+        try:
+            data[key] = base64.b64decode(value, validate=True)
+        except binascii.Error as exc:
+            raise StoreError(f"snapshot entry {key!r} is not valid base64") from exc
+    return data
 
 
 def store_size(store: Store) -> int:

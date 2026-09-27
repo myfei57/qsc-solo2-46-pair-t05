@@ -18,8 +18,9 @@ from .errors import StoreNotFound
 from .geometry import Point
 from .hoist import Hoist
 from .limit import Limit
+from .recovery import RecoveryReport, recover_store
 from .slew import Slew, SpeedFeedback
-from .store import FileStore, MemoryStore, Store, decode_snapshot, encode_snapshot
+from .store import FileStore, MemoryStore, Store, atomic_write, encode_snapshot
 from .trolley import Trolley
 from .wind import Wind
 from .zone import ZoneState
@@ -45,7 +46,7 @@ class App:
         site_config.save_config(self.store, self.console.config)
         if self.snapshot_path is not None:
             self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            self.snapshot_path.write_bytes(encode_snapshot(self.store.snapshot()))
+            atomic_write(self.snapshot_path, encode_snapshot(self.store.snapshot()))
 
 
 def default_positions() -> dict[str, Point]:
@@ -62,10 +63,11 @@ def build_app(data_dir: str = "data", web_root: str = "web") -> App:
     if data_dir in MEMORY_DIRECTORIES:
         store: Store = MemoryStore()
         snapshot_path: Path | None = None
+        recovery: RecoveryReport | None = None
     else:
         store = FileStore(data_dir)
         snapshot_path = Path(data_dir) / "snapshot.json"
-        restore_boot(store, snapshot_path)
+        recovery = recover_store(store, snapshot_path)
 
     cluster = Cluster(default_positions())
     zone = ZoneState("zone-1", "吊装作业区", default_boundary())
@@ -100,15 +102,9 @@ def build_app(data_dir: str = "data", web_root: str = "web") -> App:
         web_root=web_root,
     )
     audit.record("system", "boot", "control service started")
+    if recovery is not None and recovery.quarantined:
+        audit.record("system", "recovery", recovery.summary())
     return App(console=console, store=store, audit=audit, snapshot_path=snapshot_path)
-
-
-def restore_boot(store: Store, snapshot_path: Path) -> None:
-    try:
-        payload = snapshot_path.read_bytes()
-    except FileNotFoundError:
-        return
-    store.restore(decode_snapshot(payload))
 
 
 def restore_audit(store: Store, audit: Audit) -> None:
