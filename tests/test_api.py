@@ -261,6 +261,46 @@ class BootSnapshotTests(unittest.TestCase):
             self.assertTrue(any(entry.action == "shutdown" for entry in second.console.audit.snapshot()))
             second.shutdown()
 
+    def test_corrupt_snapshot_is_quarantined_and_boot_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = build_app(directory, web_root=str(WEB_ROOT))
+            dispatch(
+                first.console,
+                "POST",
+                "/api/config",
+                {"site_name": "华东六号", "safe_separation": 20},
+            )
+            first.shutdown()
+            snapshot_path = Path(directory) / "snapshot.json"
+            self.assertTrue(snapshot_path.is_file())
+
+            # A power cut halfway through the next snapshot write leaves a torn file.
+            torn = b'{"version": 1, "data": {"config/site": "ey'
+            snapshot_path.write_bytes(torn)
+
+            with self.assertLogs("cranefleet.wiring", level="WARNING") as caught:
+                second = build_app(directory, web_root=str(WEB_ROOT))
+            quarantined = sorted(
+                entry.name
+                for entry in Path(directory).iterdir()
+                if entry.name.startswith("snapshot.json.corrupt-")
+            )
+            self.assertEqual(len(quarantined), 1)
+            self.assertFalse(snapshot_path.exists())
+            self.assertEqual((Path(directory) / quarantined[0]).read_bytes(), torn)
+            self.assertIn(quarantined[0], "\n".join(caught.output))
+
+            # The per-key data files are the recovery point: the service comes up.
+            self.assertEqual(second.console.config.site_name, "华东六号")
+            self.assertEqual(second.console.config.safe_separation, 20.0)
+            second.shutdown()
+
+            # The next shutdown has written a fresh snapshot and the boot is clean again.
+            self.assertTrue(snapshot_path.is_file())
+            third = build_app(directory, web_root=str(WEB_ROOT))
+            self.assertEqual(third.console.config.site_name, "华东六号")
+            third.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

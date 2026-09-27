@@ -10,13 +10,15 @@ production and in memory during tests.
 from __future__ import annotations
 
 import base64
+import binascii
+import hashlib
 import json
 import os
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from .errors import StoreError, StoreNotFound
+from .errors import SnapshotCorrupt, StoreError, StoreNotFound
 
 SNAPSHOT_VERSION = 1
 
@@ -129,19 +131,66 @@ class MemoryStore(Store):
 def encode_snapshot(snapshot: dict[str, bytes]) -> bytes:
     """Encode a snapshot into a single JSON document."""
 
+    data = {key: base64.b64encode(value).decode("ascii") for key, value in snapshot.items()}
     payload = {
         "version": SNAPSHOT_VERSION,
-        "data": {key: base64.b64encode(value).decode("ascii") for key, value in snapshot.items()},
+        "data": data,
+        "checksum": _checksum(data),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
 
 
 def decode_snapshot(encoded: bytes) -> dict[str, bytes]:
-    """Decode a snapshot produced by :func:`encode_snapshot`."""
+    """Decode and validate a snapshot produced by :func:`encode_snapshot`.
 
-    payload = json.loads(encoded.decode("utf-8"))
-    data = payload.get("data") or {}
-    return {key: base64.b64decode(value) for key, value in data.items()}
+    Raises :class:`SnapshotCorrupt` when the payload does not parse or fails
+    its integrity check, so the caller can quarantine the file and fall back
+    to an earlier recovery point instead of crashing the boot.
+    """
+
+    try:
+        text = encoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SnapshotCorrupt("snapshot is not valid UTF-8") from exc
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SnapshotCorrupt(f"snapshot is not valid JSON: {exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise SnapshotCorrupt("snapshot envelope is not a JSON object")
+    version = payload.get("version")
+    if version != SNAPSHOT_VERSION:
+        raise SnapshotCorrupt(f"unsupported snapshot version {version!r}")
+    data = payload.get("data")
+    if not isinstance(data, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in data.items()
+    ):
+        raise SnapshotCorrupt("snapshot data is not a string map")
+    checksum = payload.get("checksum")
+    if checksum is not None and checksum != _checksum(data):
+        raise SnapshotCorrupt("snapshot checksum mismatch")
+    try:
+        return {key: base64.b64decode(value, validate=True) for key, value in data.items()}
+    except binascii.Error as exc:
+        raise SnapshotCorrupt("snapshot payload is not valid base64") from exc
+
+
+def write_snapshot(path: Path, payload: bytes) -> None:
+    """Write the boot snapshot atomically so a power cut cannot tear it."""
+
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        temporary.write_bytes(payload)
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise StoreError(f"cannot persist snapshot {path}") from exc
+
+
+def _checksum(data: dict[str, str]) -> str:
+    """Digest the canonical form of the encoded payload map."""
+
+    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def store_size(store: Store) -> int:

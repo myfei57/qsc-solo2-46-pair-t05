@@ -19,6 +19,10 @@ class StoreNotFound(StoreError):
     """Raised when a store key has never been written."""
 
 
+class SnapshotCorrupt(StoreError):
+    """Raised when a persisted snapshot fails validation."""
+
+
 class ZoneError(CraneFleetError):
     """Raised when a collision-zone operation is rejected."""
 

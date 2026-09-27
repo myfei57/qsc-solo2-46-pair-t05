@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from cranefleet.audit import Audit, AuditEntry
-from cranefleet.errors import StoreNotFound
+from cranefleet.errors import SnapshotCorrupt, StoreNotFound
 from cranefleet.store import (
     FileStore,
     MemoryStore,
@@ -70,6 +72,33 @@ class SnapshotEncodingTests(unittest.TestCase):
     def test_round_trip(self) -> None:
         encoded = encode_snapshot({"a": b"\x00\x01", "b": b"text"})
         self.assertEqual(decode_snapshot(encoded), {"a": b"\x00\x01", "b": b"text"})
+
+    def test_decode_rejects_truncated_payload(self) -> None:
+        encoded = encode_snapshot({"a": b"\x00\x01", "b": b"text"})
+        with self.assertRaises(SnapshotCorrupt):
+            decode_snapshot(encoded[: len(encoded) // 2])
+
+    def test_decode_rejects_checksum_mismatch(self) -> None:
+        payload = json.loads(encode_snapshot({"a": b"text"}).decode("utf-8"))
+        payload["data"]["a"] = base64.b64encode(b"other").decode("ascii")
+        with self.assertRaises(SnapshotCorrupt):
+            decode_snapshot(json.dumps(payload).encode("utf-8"))
+
+    def test_decode_rejects_unsupported_version(self) -> None:
+        payload = json.loads(encode_snapshot({"a": b"text"}).decode("utf-8"))
+        payload["version"] = 99
+        with self.assertRaises(SnapshotCorrupt):
+            decode_snapshot(json.dumps(payload).encode("utf-8"))
+
+    def test_decode_rejects_invalid_base64(self) -> None:
+        payload = {"version": 1, "data": {"a": "!!!not-base64!!!"}}
+        with self.assertRaises(SnapshotCorrupt):
+            decode_snapshot(json.dumps(payload).encode("utf-8"))
+
+    def test_decode_accepts_legacy_snapshot_without_checksum(self) -> None:
+        legacy = {"version": 1, "data": {"a": base64.b64encode(b"text").decode("ascii")}}
+        decoded = decode_snapshot(json.dumps(legacy).encode("utf-8"))
+        self.assertEqual(decoded, {"a": b"text"})
 
     def test_store_metrics(self) -> None:
         store = MemoryStore()

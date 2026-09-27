@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import cluster as fleet
@@ -14,18 +16,27 @@ from .audit import Audit, AuditEntry
 from .cluster import Cluster
 from .console import Console
 from .crane import Crane
-from .errors import StoreNotFound
+from .errors import SnapshotCorrupt, StoreNotFound
 from .geometry import Point
 from .hoist import Hoist
 from .limit import Limit
 from .slew import Slew, SpeedFeedback
-from .store import FileStore, MemoryStore, Store, decode_snapshot, encode_snapshot
+from .store import (
+    FileStore,
+    MemoryStore,
+    Store,
+    decode_snapshot,
+    encode_snapshot,
+    write_snapshot,
+)
 from .trolley import Trolley
 from .wind import Wind
 from .zone import ZoneState
 
 AUDIT_KEY = "audit/entries"
 MEMORY_DIRECTORIES = {"", "memory", ":memory:"}
+
+LOGGER = logging.getLogger("cranefleet.wiring")
 
 
 @dataclass(frozen=True)
@@ -45,7 +56,7 @@ class App:
         site_config.save_config(self.store, self.console.config)
         if self.snapshot_path is not None:
             self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            self.snapshot_path.write_bytes(encode_snapshot(self.store.snapshot()))
+            write_snapshot(self.snapshot_path, encode_snapshot(self.store.snapshot()))
 
 
 def default_positions() -> dict[str, Point]:
@@ -104,11 +115,44 @@ def build_app(data_dir: str = "data", web_root: str = "web") -> App:
 
 
 def restore_boot(store: Store, snapshot_path: Path) -> None:
+    """Load the boot snapshot into the store before the components come up.
+
+    A missing snapshot means a fresh start. A corrupt snapshot is quarantined
+    and reported, and the boot falls back to the per-key data files, which
+    still hold the state as of the last runtime persist.
+    """
+
     try:
         payload = snapshot_path.read_bytes()
     except FileNotFoundError:
         return
-    store.restore(decode_snapshot(payload))
+    try:
+        snapshot = decode_snapshot(payload)
+    except SnapshotCorrupt as exc:
+        quarantined = quarantine_snapshot(snapshot_path)
+        LOGGER.warning(
+            "boot snapshot %s is corrupt (%s); quarantined to %s, "
+            "recovering from the per-key data files instead",
+            snapshot_path,
+            exc,
+            quarantined,
+        )
+        return
+    store.restore(snapshot)
+    LOGGER.info("restored boot snapshot %s (%d keys)", snapshot_path, len(snapshot))
+
+
+def quarantine_snapshot(snapshot_path: Path) -> Path:
+    """Move a corrupt snapshot aside so the next boot does not trip over it."""
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    candidate = snapshot_path.with_name(f"{snapshot_path.name}.corrupt-{stamp}")
+    counter = 1
+    while candidate.exists():
+        candidate = snapshot_path.with_name(f"{snapshot_path.name}.corrupt-{stamp}-{counter}")
+        counter += 1
+    snapshot_path.rename(candidate)
+    return candidate
 
 
 def restore_audit(store: Store, audit: Audit) -> None:
